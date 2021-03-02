@@ -1,0 +1,515 @@
+rm(list=ls())
+setwd('D:/Projects/colonCancer_expData_analysis/LDA/allGenes')
+# ---------- Part I: Select colon sample information. ----------
+library(data.table)
+library(stringr)
+selectSamples <- function(phenotypeFile, tissueType, sampleType){
+  phenotype <- fread(phenotypeFile)
+  samplesInfo <- phenotype[phenotype$`_primary_site`==tissueType,]
+  samplesInfo$sample <- str_replace_all(samplesInfo$sample, '-', '\\.')
+  samplesInfo <- subset(samplesInfo, `_sample_type`%in%sampleType)
+}
+colonSamplesInfo <-
+  selectSamples('D:/PublicData/DataFromXena/TcgaTargetGTEX_phenotype.txt', 'Colon',
+                c('Normal Tissue', 'Primary Tumor', 'Solid Tissue Normal'))
+geneAnno <- read.table('D:/PublicData/DataFromXena/gencode.v23.annotation.gene.probemap',
+                       header=T)
+geneAnno$id <- sapply(str_split(geneAnno$id, '\\.'), `[`, 1)
+# ---------- Part I end ----------
+
+# ---------- Part II: Select the expression data of colon samples. ----------
+selectExpData <- function(expDataFile, samplesInfo){
+  expData <- data.frame(fread(expDataFile,stringsAsFactors=F,
+                              header=T, sep='\t', nThread = 12))
+    #fread() get data.table class, data frame transformation is needed
+    #for downstream analysis.
+  sampleIDs <- intersect(colnames(expData), samplesInfo$sample)
+  selectedExpData <- expData[,c(1, which(names(expData) %in% sampleIDs))]
+  selectedSamplesInfo <- samplesInfo[samplesInfo$sample %in% sampleIDs,]
+  return(list(selectedExpData, selectedSamplesInfo))
+}
+selectedData <-
+  selectExpData('D:/PublicData/DataFromXena/TCGA-GTEx-TARGET-gene-exp-counts.deseq2-normalized.log2',
+                colonSamplesInfo)
+colonGeneExpCountsDeseq2Normalized <- selectedData[[1]]
+colonSamplesInfo <- selectedData[[2]]
+rm(selectedData)
+# ---------- Part II end ----------
+
+# ---------- Part III: Clean expression data. ----------
+library(factoextra)
+cleanData <- function(expData, samplesInfo){
+  rownames(expData) <-expData[,1]
+  expData <- expData[,-1]
+  rownames(expData) <- sapply(str_split(rownames(expData), '\\.'), `[`, 1)
+    # Remove the version numbers of ensembl IDs.
+  tumorIndex <- samplesInfo$`_sample_type`=='Primary Tumor'
+  adjacentIndex <- samplesInfo$`_sample_type`=='Solid Tissue Normal'
+  normalIndex <- samplesInfo$`_sample_type`=='Normal Tissue'
+  genesNotExp <- rowSums(expData[, tumorIndex]!=0)<=0.1*sum(tumorIndex)|
+                 rowSums(expData[, adjacentIndex]!=0)<=0.1*sum(adjacentIndex)|
+                 rowSums(expData[, normalIndex]!=0)<=0.1*sum(normalIndex)
+  samplesNotExp <- colSums(expData==0)==dim(expData)[1]
+  filteredExpData <- expData[!genesNotExp,!samplesNotExp]
+    # Remove the genes whose expression level are zero in more than 95% samples.
+    # Remove the samples whose expression levels are zero in more than 95% genes.
+  sampleIDs <- intersect(colnames(filteredExpData), samplesInfo$sample)
+  filteredSamplesInfo <- samplesInfo[samplesInfo$sample %in% sampleIDs,]
+    # Update the sample information.
+  sampleIDs <- data.frame(sampleIDs=colnames(filteredExpData))
+  filteredSamplesInfo <- merge(sampleIDs, filteredSamplesInfo,
+                               by.x='sampleIDs', by.y='sample', sort=F)
+    # Adjust the order of sample IDs in expression data and sample information.
+  filteredSamplesInfo$`_sample_type` <- factor(filteredSamplesInfo$`_sample_type`)
+  return(list(filteredExpData, filteredSamplesInfo))
+}
+cleanedData <- cleanData(colonGeneExpCountsDeseq2Normalized, colonSamplesInfo)
+colonGeneExpCountsDeseq2Normalized <- cleanedData[[1]]
+colonSamplesInfo <- cleanedData[[2]]
+rm(cleanedData)
+
+pcaAllSamples <- prcomp(t(as.matrix(colonGeneExpCountsDeseq2Normalized)))
+fviz_pca_ind(pcaAllSamples, col.ind=colonSamplesInfo$`_sample_type`,
+             mean.point=F, addEllipses = T, repel=T, geom='point',
+             legend.title="Sample Type", title='PCA of All Samples')
+outliers <- rownames(pcaAllSamples$x)[pcaAllSamples$x[,2]>500]
+colonGeneExpCountsDeseq2Normalized <-
+  colonGeneExpCountsDeseq2Normalized[
+    ,!(names(colonGeneExpCountsDeseq2Normalized) %in% outliers)]
+colonSamplesInfo <-
+  colonSamplesInfo[!(colonSamplesInfo$sampleIDs %in% outliers),]
+expDataWithAllGenesMt <- t(as.matrix(colonGeneExpCountsDeseq2Normalized))
+rm(colonGeneExpCountsDeseq2Normalized)
+rm(outliers)
+rm(pcaAllSamples)
+save(pcaAllSamples, file='pcaAllSamples.RData')
+save(expDataWithAllGenesMt, file='expDataWithAllGenesMt.RData')
+save(colonSamplesInfo, file='colonSamplesInfo.RData')
+# ---------- Part III end ----------
+
+# ---------- Part IV: PCA ----------
+library(Rmisc)
+plotPCA <- function(expData, title){
+  pca <- prcomp(expData)
+  screePlot <- fviz_eig(pca, addlabels=T, ylim=c(0, 50), main=title)
+  pcaPlot <- fviz_pca_ind(pca, col.ind=colonSamplesInfo$`_sample_type`,
+                          mean.point=F, addEllipses = T, repel=T,
+                          geom='point', legend.title="Sample Type",
+                          xlim=c(-250,400), ylim=c(-250,200), title=title)
+  return(list(screePlot=screePlot, pcaPlot=pcaPlot))
+}
+
+pcaAllGenes <- plotPCA(expDataWithAllGenesMt, title='All Genes')
+save(file='pcaAllGenes.RData', pcaAllGenes)
+multiplot(pcaAllGenes[[1]], pcaAllGenes[[2]], cols=2)
+# ---------- Part IV end ----------
+
+# ---------- Part V: LDA ----------
+library(MASS)
+getLDAmodelAndPred <- function(expData, groups, randomSeed, trainRatio){
+  sampleNumber <- dim(expData)[1]
+  set.seed(randomSeed)
+  trainIndex <- sample(sampleNumber, sampleNumber * trainRatio)
+  testIndex <- (1:sampleNumber)[-trainIndex]
+  ldaModel <- lda(expData, grouping=groups, subset=trainIndex)
+  pred <- predict(ldaModel, expData[testIndex,])$class
+  return(list(ldaModel, pred, testIndex))
+}
+LDAmodel <- getLDAmodelAndPred(expDataWithAllGenesMt,
+                               colonSamplesInfo$`_sample_type`,
+                               42, 0.8)
+save(LDAmodel, file='LDAmodel.RData')
+
+plotLDAmodel <- function(expData, group, ldaModelAndPred, title, xlim, ylim){
+  ldaModel <- ldaModelAndPred[[1]]
+  pred <- ldaModelAndPred[[2]]
+  testIndex <- ldaModelAndPred[[3]]
+  trainGroup <- group[-testIndex]
+  testGroup <- group[testIndex]
+  predPerformance <- table(group[testIndex], pred)
+  z <- expData[-testIndex,] %*% ldaModel$scaling
+  plot(z[,1], z[,2], xlab='LD1', ylab='LD2', xlim=xlim, ylim=ylim,
+       pch=as.numeric(trainGroup), col=as.numeric(trainGroup)+1,
+       main=title)
+  legend('topleft', c('Normal', 'Tumor', 'Adjacent'), 
+         pch=c(1,2,3), col=c(2,3,4))
+  return(list(z, predPerformance))
+}
+
+pAllGenes <- plotLDAmodel(expDataWithAllGenesMt,
+                          colonSamplesInfo$`_sample_type`,
+                          LDAmodel, 'All Genes', c(5,35), c(12, 40))
+# ---------- Part V end ----------
+
+# ---------- Part VI: Recursive feature elimination ----------
+
+# Recursive features elimination and get optional genes.
+multiRfe <- function(dataSet, group, randomSeed, sizeRatios){
+  library(caret)
+  library(doSNOW)
+  cl <- makeCluster(12, type='SOCK')
+  registerDoSNOW(cl)
+  set.seed(randomSeed)
+  randomSeeds <- sample(1000,50)
+  ldaModels <- list()
+  testSetList <- list()
+  j <- 1
+  for (i in randomSeeds) {
+    sampleNumber <- dim(dataSet)[1]
+    set.seed(i)
+    randomSamples <- sample(sampleNumber, sampleNumber*0.8) 
+    trainSet <- dataSet[randomSamples,]
+    trainLabels <- group[randomSamples]
+    tumorIndex <- trainLabels=='Primary Tumor'
+    adjacentIndex <- trainLabels=='Solid Tissue Normal'
+    normalIndex <- trainLabels=='Normal Tissue'
+    genesNotExp <- colSums(trainSet[tumorIndex,]!=0)<=0.1*sum(tumorIndex)|
+                   colSums(trainSet[adjacentIndex,]!=0)<=0.1*sum(adjacentIndex)|
+                   colSums(trainSet[normalIndex,]!=0)<=0.1*sum(normalIndex)
+    trainSet <- trainSet[, !genesNotExp]
+    testSet <- dataSet[-randomSamples, !genesNotExp]
+    testLabels <- group[-randomSamples]
+    ldaProfile <- rfe(
+      as.data.frame(trainSet), trainLabels,
+      # Grouping parameter must be factor, or R will throw 
+      # "Error during wrapup: subscript out of bounds"
+      sizes = floor(dim(trainSet)[2]*sizeRatios),
+      rfeControl = rfeControl(functions = ldaFuncs, method = "cv", rerank=T))
+    ldaModels[[j]] <- ldaProfile
+    testSetList[[j]] <- list(testSet, testLabels)
+    print(paste('Model', j, 'completed!'))
+    j <- j + 1
+  }
+  stopCluster(cl)
+  return(list(ldaModels, testSetList))
+}
+
+rfeResultsAllGenes <- multiRfe(expDataWithAllGenesMt,
+                               colonSamplesInfo$`_sample_type`, 42,
+                               c(0.6^(0:6), 0.6^6*(0.7^(1:7))))
+save(rfeResultsAllGenes, file='rfeResultsAllGenes.RData')
+
+rfeModelsAllGenes <- rfeResultsAllGenes[[1]]
+testSetAllGenes <- lapply(rfeResultsAllGenes[[2]], `[[`, 1)
+testSetLabelsAllGenes <- lapply(rfeResultsAllGenes[[2]], `[[`, 2)
+rm(rfeResultsAllGenes)
+# ---------- Part VI end ----------
+
+
+# ---------- Part VII: Validate the LDA models ----------
+validateRfeModels <- function(model, testSet, testSetLabel){
+  pred <- predict(model, testSet)[,1]
+  return(table(pred, testSetLabel))
+}
+
+getValidateResults <- function(modelList, testSetList, testSetLabelList){
+  if (length(modelList)==length(testSetList)&&
+      length(testSetLabelList)==length(testSetLabelList)) {
+    validateResults <- list()
+    for (i in 1:length(modelList)) {
+      validateResults[[i]] <- validateRfeModels(modelList[[i]],
+                                                testSetList[[i]],
+                                                testSetLabelList[[i]])
+    }  
+  }
+  return(validateResults)
+}
+
+validateResultsAllGenes <-
+  getValidateResults(rfeModelsAllGenes, testSetAllGenes, testSetLabelsAllGenes)
+performanceAllGenes <- prop.table(Reduce('+', validateResultsAllGenes))
+  # Reduce() function can concatenate the elements of the second argument with
+  # the first argument and calculate the result.
+# ---------- Part VII end ----------
+
+# ---------- Part VIII: Optional Genes acquisition ----------
+getConsistantGenes <- function(rfeModels, threshold){
+  optEnsemblIDs <- data.frame(table(Reduce('c', sapply(rfeModels, `[[`, 6))))
+  names(optEnsemblIDs) <- c('id', 'Freq')
+  consistantEnsemblIDs <- optEnsemblIDs[optEnsemblIDs$Freq>threshold,]
+  consistantGenes <- merge(geneAnno, consistantEnsemblIDs, by='id', sort=F)
+  return(consistantGenes)
+}
+consistantGenesAll <- getConsistantGenes(rfeModelsAllGenes, 25)
+write.csv(consistantGenesAll, file='consistantGenesAll.csv')
+# ---------- Part VIII end ----------
+
+# ---------- Part IX: Further RFE. ----------
+allOptGenes <- getConsistantGenes(rfeModelsAllGenes, 0)
+write.csv(allOptGenes, file='results/allOptGenes.csv')
+expDataWith1stOptGenes <- subset(expDataWithAllGenesMt,
+                                 select=colnames(expDataWithAllGenesMt)
+                                 %in% allOptGenes$id)
+rfeModelsOptGenes <- multiRfe(expDataWith1stOptGenes,
+                              colonSamplesInfo$`_sample_type`, 42,
+                              c(0.7^(0:10), 0.7^10*0.9^(1:10)))
+save(rfeResultsOptGenes, file='rfeResultsOptGenes.RData')
+rfeModelsOptGenes <- rfeResultsOptGenes[[1]]
+testSetOptGenes <- lapply(rfeResultsOptGenes[[2]], `[[`, 1)
+testSetLabelsOptGenes <- lapply(rfeResultsOptGenes[[2]], `[[`, 2)
+rm(rfeResultsOptGenes)
+consistantOptGenes <- getConsistantGenes(rfeModelsOptGenes, 30)
+save(consistantOptGenes, file='consistantOptGenes.RData')
+# ---------- Part IX end ----------
+
+# ---------- Part IX: Validate optional genes. ----------
+expDataOptGenesAll <- subset(expDataWithAllGenesMt,
+                             select=colnames(expDataWithAllGenesMt)
+                             %in% consistantGenesAll$id)
+optGenesAllLDAmodel <- getLDAmodelAndPred(expDataOptGenesAll,
+                                          colonSamplesInfo$`_sample_type`,
+                                          42, 0.8)
+pOptGenesAll <- plotLDAmodel(expDataOptGenesAll,
+                             colonSamplesInfo$`_sample_type`,
+                             optGenesAllLDAmodel,
+                             'Optional Genes with All Genes',
+                             c(-30,10), c(-10, 30))
+
+expDataWith2ndOptGenes <- subset(expDataWithAllGenesMt,
+                                 select=colnames(expDataWithAllGenesMt)
+                                 %in% consistantOptGenes$id)
+optGenes2ndLDAmodel <- getLDAmodelAndPred(expDataWith2ndOptGenes,
+                                          colonSamplesInfo$`_sample_type`,
+                                          42, 0.8)
+pOptGenes2nd <- plotLDAmodel(expDataWith2ndOptGenes,
+                             colonSamplesInfo$`_sample_type`,
+                             optGenes2ndLDAmodel,
+                             'Optional Genes With Optional Genes',
+                             c(-20, 20), c(-20, 20))
+
+
+# ---------- Part IX end ----------
+
+# ---------- Part X: optGenes enrichment analysis ----------
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+GO_KEGG_enrichment <- function(geneset, pvalueCutoff, qvalueCutoff){
+  ego_cc <- enrichGO(gene=geneset,
+                     keyType='ENSEMBL',
+                     OrgDb=org.Hs.eg.db,
+                     ont='CC',
+                     pAdjustMethod='BH',
+                     pvalueCutoff=pvalueCutoff,
+                     qvalueCutoff=qvalueCutoff,
+                     readable=T)
+  ego_bp <- enrichGO(gene=geneset,
+                     keyType='ENSEMBL',
+                     OrgDb=org.Hs.eg.db,
+                     ont='BP',
+                     pAdjustMethod='BH',
+                     pvalueCutoff=pvalueCutoff,
+                     qvalueCutoff=qvalueCutoff,
+                     readable=T)
+  ego_mf <- enrichGO(gene=geneset,
+                     keyType='ENSEMBL',
+                     OrgDb=org.Hs.eg.db,
+                     ont='MF',
+                     pAdjustMethod='BH',
+                     pvalueCutoff=pvalueCutoff,
+                     qvalueCutoff=qvalueCutoff,
+                     readable=T)
+  entrezID <- bitr(geneset,
+                   fromType='ENSEMBL',
+                   toType='ENTREZID',
+                   OrgDb=org.Hs.eg.db)
+  kk <- enrichKEGG(gene=entrezID$ENTREZID,
+                   organism='human',
+                   pvalueCutoff=pvalueCutoff,
+                   qvalueCutoff=qvalueCutoff)
+  results <- list()
+  results$CC <- ego_cc
+  results$BP <- ego_bp
+  results$MF <- ego_mf
+  results$KK <- kk
+  return(results)
+}
+
+allGenesEnrichment <- GO_KEGG_enrichment(consistantGenesAll$id, 0.05, 0.05)
+save(allGenesEnrichment, file='allGenesEnrichment.RData')
+
+plotEnrichResults <- function(enrichmentResults, txtwidth, showNum){
+  CCenrich <- clusterProfiler::dotplot(enrichmentResults$CC,
+                                       title='CCenrichment',
+                                       showCategory=showNum) +
+    scale_y_discrete(labels=function(x) str_wrap(x, width=txtwidth))
+    
+  BPenrich <- clusterProfiler::dotplot(enrichmentResults$BP,
+                                       title='BPenrichment',
+                                       showCategory=showNum) +
+    scale_y_discrete(labels=function(x) str_wrap(x, width=txtwidth))
+  
+  MFenrich <- clusterProfiler::dotplot(enrichmentResults$MF,
+                                       title='MFenrichment',
+                                       showCategory=showNum) +
+    scale_y_discrete(labels=function(x) str_wrap(x, width=txtwidth))
+  
+  KKenrich <- clusterProfiler::dotplot(enrichmentResults$KK,
+                                       title='KKenrichment',
+                                       showCategory=showNum) +
+    scale_y_discrete(labels=function(x) str_wrap(x, width=txtwidth))
+  multiplot(BPenrich, CCenrich, MFenrich, KKenrich, cols=4)
+}
+
+plotEnrichResults(allGenesEnrichment, 27, 20)
+# ---------- Part X end ----------
+
+# ---------- Part XI: GSEA ----------
+getGeneImportance <- function(rfemodels){
+  # This function was modified according to varImp.rfe method in caret package.
+  # Briefly, the average of Overall var in variables element was calculated as
+  # the importance of ensemblIDs.
+  # The source code of varImp.rfe method can be viewed by getAnyWhere() function.
+  EnsIDimp <- rfemodels$variables[,c(2,1)]
+  EnsIDimp <- aggregate(EnsIDimp, by=list(EnsIDimp$var), mean)
+  EnsIDimp <- data.frame(var=EnsIDimp[,1], imp=EnsIDimp[,3])
+  geneImp <- merge(EnsIDimp, geneAnno, by.x='var',by.y='id', sort=F)
+  geneImp <- data.frame(gene=geneImp$gene, imp=geneImp$imp)
+  imp <- geneImp$imp
+  names(imp) <- geneImp$gene
+  return(imp)
+}
+namedNum2Mt <- function(namedNumList){
+  rowNames <- unique(unlist(lapply(namedNumList, names)))
+  mt <- matrix(NA, nrow=length(rowNames), ncol=50,
+               dimnames=list(rowNames, 1:50))
+  for (i in seq_along(namedNumList)) {
+    mt[names(namedNumList[[i]]), i] <- namedNumList[[i]]
+  }
+  return(mt)
+}
+
+geneImpAll <- sapply(rfeModelsAllGenes, getGeneImportance)
+geneImpAllMt <- namedNum2Mt(geneImpAll)
+geneImpAllAvr <- sort(rowMeans(geneImpAllMt, na.rm=T), decreasing=T)
+
+performGSEA <- function(gmtFilePath, geneList){
+  gmtfile <- read.gmt(gmtFilePath)
+  GSEAresults <- GSEA(geneList, TERM2GENE=gmtfile)
+  return(GSEAresults)
+}
+
+GSEAresultsAllGenes <- performGSEA(
+  'D:/PublicData/DataFromGSEA/msigdb.v7.1.symbols.gmt',
+  geneImpAllAvr)
+GSEAresultsAllGenes@result <- GSEAresultsAllGenes@result[
+  order(GSEAresultsAllGenes@result$NES, decreasing = T),]
+
+drawGSEAplots <- function(resultFile, GSEAresults, GSEAenrichID){
+  pdf(resultFile)
+  for (i in GSEAenrichID[1:100]) {
+    A <- gseaplot2(GSEAresults, i, title=i, pvalue_table=T)
+    print(A)
+  }
+  dev.off()
+}
+
+drawGSEAplots('GSEAresultsAllGenesSorted.pdf',
+              GSEAresultsAllGenes,
+              GSEAresultsAllGenes@result$ID)
+# ---------- Part XI end ----------
+
+# ---------- Part XII: Optional genes expression level comparison. ----------
+plotGeneCompare <- function(ensemblID, expData, group){
+  geneID <- geneAnno[geneAnno$id == ensemblID, 2]
+  normalExpData <- expData[group=='Normal Tissue', colnames(expData)==ensemblID]
+  preExpData <- expData[group=='Solid Tissue Normal', colnames(expData)==ensemblID]
+  cancerExpData <- expData[group=='Primary Tumor', colnames(expData)==ensemblID]
+  ymax <- max(max(normalExpData, preExpData, cancerExpData))
+  ymin <- min(min(normalExpData, preExpData, cancerExpData))
+  pVal1 <- t.test(normalExpData, preExpData)
+  pVal2 <- t.test(preExpData, cancerExpData)
+  boxplot(normalExpData, preExpData, cancerExpData,
+          names=c('Normal', 'Precancer', 'Cancer'),
+          ylim=c(ymin, ymax+2), main=geneID, cex.axis=0.8)
+  text(labels=paste0('P=', signif(pVal1$p.value, 3)),
+       x=1.5, y=ymax+0.7, cex=0.6)
+  text(labels=paste0('P=', signif(pVal2$p.value, 3)),
+       x=2.5, y=ymax+0.7, cex=0.6)
+  segments(x0=c(1.1,2.1), y0=c(ymax+0.5,ymax+0.5),
+           x1=c(1.9,2.9), y1=c(ymax+0.5,ymax+0.5))
+}
+
+pdf('consistantGenesBoxplots.pdf', paper='a4')
+par(mfrow=c(2,3))
+lapply(consistantGenesAll$id, plotGeneCompare, 
+       expDataOptGenesAll, colonSamplesInfo$`_sample_type`)
+dev.off()
+# ---------- Part XII end. ----------
+
+# ---------- Part XIII: Heatmap of optional genes. ----------
+optionalGenesExpData <- subset(expDataWithAllGenesMt,
+                               select=colnames(expDataWithAllGenesMt)
+                               %in% consistantOptGenes$id)
+rownames(optionalGenesExpData) <- colonSamplesInfo$`_sample_type`
+library(pheatmap)
+pheatmap(optionalGenesExpData)
+# ---------- Part XIII end. ----------
+
+# ---------- Part XIV: Correlation analysis. ----------
+CC.optGenes <- cor(optionalGenesExpData)
+set.seed(42)
+randomSeeds <- sample(1:10000, 100)
+CCs <- list()
+for (i in 1:length(randomSeeds)) {
+  geneNum <- ncol(expDataWithAllGenesMt)
+  optGeneNum <- nrow(consistantOptGenes)
+  set.seed(randomSeeds[i])
+  randomNum <- sample(1:geneNum, optGeneNum)
+  selectedExpData <- expDataWithAllGenesMt[, randomNum]
+  CC <- cor(selectedExpData)
+  CCs[[i]] <- CC
+}
+CCs.abs <- lapply(CCs, abs)
+CCs.mean <- unlist(lapply(CCs.abs, mean))
+# ---------- Part XIV end. ----------
+
+
+# ---------- Part XV: Clinical Analysis. ----------
+# Evaluate the balance between protein synthesis/degradation by
+# the expression level of MRPS10 and PSMD14.
+cancerSamples <- colonSamplesInfo$'_sample_type'=='Primary Tumor'
+MRPS10enID <- allOptGenes[allOptGenes$gene=='MRPS10',1]
+expLvlMRPS10 <- expDataWithAllGenesMt[cancerSamples,colnames(expDataWithAllGenesMt)==MRPS10enID]
+PSMD14enID <- allOptGenes[allOptGenes$gene=='PSMD14',1]                                        
+expLvlPSMD14 <- expDataWithAllGenesMt[cancerSamples,colnames(expDataWithAllGenesMt)==PSMD14enID]
+plot(expLvlMRPS10, expLvlPSMD14)
+lm_MRPS10_PSMD14 <- lm(expLvlPSMD14~expLvlMRPS10)
+overDegradationSamples <- names(expLvlMRPS10)[lm_MRPS10_PSMD14$residuals>0.2]
+overSynthesisSamples <- names(expLvlMRPS10)[lm_MRPS10_PSMD14$residuals<(-0.2)]
+overDegradationSamples <- str_sub(overDegradationSamples,start=1, end=-4)
+overSynthesisSamples <- str_sub(overSynthesisSamples, start=1, end=-4)
+
+COADsurvivalData <- read.table('D:/PublicData/DataFromXena/TCGA-COAD.survival.tsv', header=T)
+COADsurvivalData <- COADsurvivalData[,3:5]
+COADsurvivalData$X_PATIENT <- str_replace_all(COADsurvivalData$X_PATIENT, '-', '\\.')
+COADsurvivalData <- unique(COADsurvivalData)
+COADsurvivalData_synthesis <- COADsurvivalData[COADsurvivalData$X_PATIENT %in% overSynthesisSamples,]
+COADsurvivalData_degradation <- COADsurvivalData[COADsurvivalData$X_PATIENT %in% overDegradationSamples,]
+COADsurvivalData_degradation$group <- 'overDegradation'
+COADsurvivalData_synthesis$group <- 'overSynthesis'
+COADsurvivalData <-rbind(COADsurvivalData_synthesis, COADsurvivalData_degradation)
+
+library(survminer)
+library(survival)
+fit <- survfit(Surv(X_TIME_TO_EVENT,X_OS_IND)~group, data=COADsurvivalData)
+ggsurvplot(fit, data=COADsurvivalData)
+# Survival analysis failed ...
+
+overSynthesisSamples <- data.frame(patient=overSynthesisSamples, group='overSynthesis')
+overDegradationSamples <- data.frame(patient=overDegradationSamples, group='overDegradation')
+unblancedPatients <- rbind(overDegradationSamples, overSynthesisSamples)
+patientInfo <- read.csv('D:/PublicData/DataFromXena/GDC_colon_clinical_info.csv', header=T)
+patientInfo <- subset(patientInfo, sample_type.samples=='Primary Tumor',
+                      select=c('submitter_id', 'intermediate_dimension.samples',
+                               'longest_dimension.samples', 'shortest_dimension.samples',
+                               'tumor_stage.diagnoses', 'venous_invasion',
+                               'pathologic_T', 'pathologic_N', 'pathologic_M',
+                               'lymphatic_invasion'))
+patientInfo$tumor_stage.diagnoses <- str_replace_all(patientInfo$tumor_stage.diagnoses, '[abc]$', '')
+patientInfo$submitter_id <- str_replace_all(patientInfo$submitter_id, '-', '\\.')
+unblancedPatientsInfo <- merge(unblancedPatients, patientInfo, by.x='patient',
+                               by.y='submitter_id')
+t.test(unblancedPatientsInfo$shortest_dimension.samples~unblancedPatientsInfo$group)
+boxplot(unblancedPatientsInfo$shortest_dimension.samples~unblancedPatientsInfo$group)
+# OverSynthesis patients have larger tumor size. However, this may not be related with carcinogenesis ...
